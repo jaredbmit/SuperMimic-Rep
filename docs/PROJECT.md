@@ -16,7 +16,10 @@
 ## Core workflows
 1. **数据准备**：G1 重定向 CSV → 50 Hz npz（`scripts/data/csv_to_npz_batch.py`）→ BONES-SEED
    名字过滤 + 可行性过滤（`scripts/data/filter_bones_seed.py`，论文附录 E）→ 可选打包成 fp16
-   紧凑库（`scripts/data/build_library.py`，常驻显存、在线 FK）。
+   紧凑库（`scripts/data/build_library.py`，常驻显存、在线 FK）。外部 `steering` 仓库打包好的 BONES-SEED 子集
+   （qpos.npy + index.npz，50 Hz）用 `scripts/data/steering_loco_to_library.py` 直接转成紧凑库：只读 qpos，速度按
+   `motion_convert.resample_motion` 重算（世界系角速度），名字取 CSV 文件名（保留 `_M` 镜像），清单里附附录 E 过滤原因；
+   与原 CSV 路径逐字段对照误差 ≤ 1.1e-5（远小于 fp16 存储误差）。
 2. **训练**：`sm-train`（`src/supermimic/scripts/train.py`）跑 Algorithm A.1 主循环；多卡用
    `torchrun`（每 rank 自带仿真与 replay buffer，梯度 all-reduce，lr × √world）。
 3. **性能**：`scripts/perf/profile_train.py` 稳态 profile（按阶段的发射 / 同步计数、`--sync-stacks` 同步来源）；
