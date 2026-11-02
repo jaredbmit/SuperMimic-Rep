@@ -75,6 +75,10 @@ class Trainer:
                 compact_library=cfg.env.compact_library,
                 obs_mode=cfg.env.obs_mode,
                 seed=cfg.seed + 1000 * self.rank,
+                extra_command_kwargs={
+                    k: getattr(cfg.env, k)
+                    for k in ("sgs_target", "sgs_kappa", "sgs_temp", "sgs_eps", "sgs_horizon", "sgs_init")
+                },
             ),
             device=self.device,
         )
@@ -132,6 +136,7 @@ class Trainer:
                 "critic_opt": self.policy_trainer.critic_opt.state_dict(),
                 "bin_return": self.command.bin_return,
                 "bin_memory": self.command.bin_memory,
+                "bin_success": self.command.bin_success,
                 "bin_return_normalized": True,
                 "config": asdict(self.cfg),
             },
@@ -148,6 +153,8 @@ class Trainer:
         load_optimizer_state(self.policy_trainer.critic_opt, ck["critic_opt"])
         self.command.bin_return.copy_(bin_return_from_checkpoint(ck, self.command.cfg.g_max))
         self.command.bin_memory.copy_(ck["bin_memory"])
+        if "bin_success" in ck:  # absent before sampling_mode "sgs"; the prior sgs_init stays
+            self.command.bin_success.copy_(ck["bin_success"])
         self.iteration = ck["iteration"]
         self.num_updates = ck["num_updates"]
         if ck.get("iteration_semantics") == "update":
@@ -291,6 +298,9 @@ class Trainer:
                     self.writer.add_scalar("sampler/hard_mass_clip_end_bins", float(self.command.metrics["hard_mass_clip_end"][0]), it)
                     self.writer.add_scalar("sampler/hard_top_clip_share", float(self.command.metrics["hard_top_clip_share"][0]), it)
                     self.writer.add_scalar("sampler/hard_eff_clips", float(self.command.metrics["hard_eff_clips"][0]), it)
+                    self.writer.add_scalar("sampler/bin_success_mean", float(self.command.bin_success.mean()), it)
+                    for k in ("lo", "mid", "hi"):
+                        self.writer.add_scalar(f"sampler/mass_success_{k}", float(self.command.metrics[f"mass_success_{k}"][0]), it)
                     dt_log = time.time() - last_log
                     last_log = time.time()
                     msg = (

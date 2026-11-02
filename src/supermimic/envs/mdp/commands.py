@@ -7,7 +7,7 @@ functions work unchanged, plus:
 * ``goal``        (N, K*68) future-frame goal features (plan D5)
 * ``root_*``      reference pelvis quantities for the paper's root terminations
 * ``clip_end``    (N,) True once the clip's last frame has been reached (time-out)
-* return-based reset sampling over 1 s bins of the whole library (plan D14)
+* return-based reset sampling over 1 s bins of the whole library (plan D14), or success-guided sampling (SGS)
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from mjlab.utils.lab_api.math import (
 )
 
 from supermimic.envs.mdp.motion_library import MotionLibrary
-from supermimic.envs.mdp.sampler_math import cap_group_mass, normalized_returns_to_go
+from supermimic.envs.mdp.sampler_math import cap_group_mass, normalized_returns_to_go, sgs_weights, survival_labels
 
 if TYPE_CHECKING:
     from mjlab.entity import Entity
@@ -71,6 +71,9 @@ class MultiClipMotionCommand(CommandTerm):
         # Per-bin completion: discounted return-to-go / attainable return-to-go, in [0, 1] (1 = untouched).
         self.bin_return = torch.full((lib.num_bins,), 1.0, device=self.device)
         self.bin_memory = torch.full((lib.num_bins,), 1.0 / lib.num_bins, device=self.device)
+        # Per-bin success rate (EMA of "survived sgs_horizon steps, or reached the clip end"); drives sampling_mode
+        # "sgs", tracked in every mode for telemetry.
+        self.bin_success = torch.full((lib.num_bins,), cfg.sgs_init, device=self.device)
         self.time_limit_steps = int(math.ceil(env.cfg.episode_length_s / env.step_dt))
         self.max_ep_steps = min(self.time_limit_steps + 2, cfg.max_logged_steps)
         # Evaluation hook: when >= 0, the next reset of that env starts exactly at this global frame.
@@ -83,7 +86,7 @@ class MultiClipMotionCommand(CommandTerm):
 
         for k in ("error_anchor_pos", "error_anchor_rot", "error_body_pos", "error_body_rot",
                   "error_joint_pos", "error_joint_vel", "sampling_entropy", "episode_return_to_go", "hard_mass_clip_end",
-                  "hard_top_clip_share", "hard_eff_clips"):
+                  "hard_top_clip_share", "hard_eff_clips", "mass_success_lo", "mass_success_mid", "mass_success_hi"):
             self.metrics[k] = torch.zeros(n, device=self.device)
 
     # ------------------------------------------------------------------ reference (mjlab MotionCommand API)
@@ -240,6 +243,7 @@ class MultiClipMotionCommand(CommandTerm):
         rem_term = self.library.last_frame_of(self.frame[env_ids]) - self.frame[env_ids]
         n_star = torch.where(terminated, torch.minimum(lens + rem_term, torch.full_like(lens, self.time_limit_steps)), lens)
         g_norm = normalized_returns_to_go(rtg, n_star, cfg.gamma, cfg.g_max)
+        self._update_bin_success(bins, lens, terminated, truncated, T)
         valid = tmask.reshape(-1)
         b = bins.reshape(-1)[valid]
         g = g_norm.reshape(-1)[valid].float()
@@ -253,6 +257,18 @@ class MultiClipMotionCommand(CommandTerm):
         self.metrics["episode_return_to_go"][env_ids] = rtg[:, 0].float()
         self.ep_len[env_ids] = 0
 
+    def _update_bin_success(self, bins, lens, terminated, truncated, T) -> None:
+        """EMA of each bin's per-step survival outcome over the finished episodes (same cadence as bin_return)."""
+        succ, valid = survival_labels(lens, terminated, truncated, self.cfg.sgs_horizon, T)
+        b = bins[valid]
+        if b.numel() == 0:
+            return
+        sums = torch.zeros(self.library.num_bins, device=self.device).index_add_(0, b, succ[valid])
+        cnts = torch.zeros(self.library.num_bins, device=self.device).index_add_(0, b, torch.ones_like(succ[valid]))
+        touched = cnts > 0
+        a = self.cfg.ema_alpha
+        self.bin_success[touched] = (1 - a) * self.bin_success[touched] + a * sums[touched] / cnts[touched]
+
     # ------------------------------------------------------------------ sampling
 
     def _sample_frames(self, n: int) -> torch.Tensor:
@@ -265,9 +281,14 @@ class MultiClipMotionCommand(CommandTerm):
             # Uniform over frames (long clips get proportionally more starts), leaving >= 2 steps.
             f = torch.randint(0, lib.num_frames, (n,), device=self.device)
             return torch.minimum(f, lib.last_frame_of(f) - 2).clamp_min(0)
-        assert cfg.sampling_mode == "return"
-        # Paper: softmax_b(-25 G_b / G_max); bin_return already holds G_b relative to the attainable return.
-        hard = torch.softmax(-cfg.softmax_temp * self.bin_return, dim=0)
+        if cfg.sampling_mode == "return":
+            # Paper: softmax_b(-25 G_b / G_max); bin_return already holds G_b relative to the attainable return.
+            hard = torch.softmax(-cfg.softmax_temp * self.bin_return, dim=0)
+        else:
+            assert cfg.sampling_mode == "sgs"
+            # Not in the paper: success-guided sampling (arXiv 2610.12465) replaces the hardest-first softmax; the
+            # uniform floor, per-clip cap and memory term stay as in "return".
+            hard = sgs_weights(self.bin_success, cfg.sgs_target, cfg.sgs_kappa, cfg.sgs_temp, cfg.sgs_eps)
         # Not in the paper: no clip gets more than hard_clip_cap of the hard mass (the memory term inherits it).
         hard, clip_mass, clip_mass_capped = cap_group_mass(hard, lib.bin_clip, lib.num_clips, cfg.hard_clip_cap)
         self.metrics["hard_top_clip_share"][:] = clip_mass.max()
@@ -286,6 +307,11 @@ class MultiClipMotionCommand(CommandTerm):
         f = torch.minimum(f, lib.last_frame_of(f) - 2).clamp_min(lib.clip_start[lib.frame_clip[f]])
         ent = -(p * (p + 1e-12).log()).sum() / math.log(max(lib.num_bins, 2))
         self.metrics["sampling_entropy"][:] = ent
+        # Reset mass by success tercile of the bin (any mode).
+        s = self.bin_success
+        self.metrics["mass_success_lo"][:] = p[s < 1 / 3].sum()
+        self.metrics["mass_success_mid"][:] = p[(s >= 1 / 3) & (s <= 2 / 3)].sum()
+        self.metrics["mass_success_hi"][:] = p[s > 2 / 3].sum()
         return f
 
     def _write_reference_state_to_sim(self, env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel):
@@ -421,7 +447,7 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     pose_range: dict[str, tuple[float, float]] = field(default_factory=dict)
     velocity_range: dict[str, tuple[float, float]] = field(default_factory=dict)
     joint_position_range: tuple[float, float] = (0.0, 0.0)
-    sampling_mode: Literal["return", "uniform", "start"] = "return"
+    sampling_mode: Literal["return", "uniform", "start", "sgs"] = "return"
     # Return-based sampling (plan D14).
     uniform_ratio: float = 0.5
     hard_ratio: float = 0.4
@@ -433,7 +459,17 @@ class MultiClipMotionCommandCfg(CommandTermCfg):
     hard_clip_cap: float = 0.01
     g_max: float = 10.0  # largest attainable discounted return (max step reward / (1 - gamma)); normalizes bin returns
     gamma: float = 0.99
-    ema_alpha: float = 0.05
+    ema_alpha: float = 0.05  # EMA rate of bin_return and bin_success
+    # Success-guided sampling (sampling_mode="sgs"; arXiv 2610.12465, locomotion values t=0.66, kappa=5, T=2).
+    # A step succeeds if the episode survives sgs_horizon more steps or reaches the clip end.
+    sgs_target: float = 0.66  # success rate the kernel peaks at (its mode)
+    sgs_kappa: float = 5.0  # kernel concentration
+    sgs_temp: float = 2.0  # softmax temperature over log weights
+    # Floor inside the SGS mass: a solved or hopeless bin weighs (eps / w_peak)^(1/T) of a frontier bin, 5e-4 at
+    # 1e-8 (paper, locomotion) but 5e-2 at 1e-4 (paper, manipulation), which on ~2e5 mostly solved bins is near uniform.
+    sgs_eps: float = 1e-8
+    sgs_horizon: int = 50  # survival horizon in steps (1 s)
+    sgs_init: float = 0.5  # success rate of a never-visited bin
     memory_alpha: float = 0.01
     min_remaining_steps: int = 100
     max_logged_steps: int = 1024

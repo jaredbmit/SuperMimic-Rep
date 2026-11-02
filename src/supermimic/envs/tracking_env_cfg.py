@@ -79,7 +79,7 @@ class SuperMimicEnvCfgArgs:
     obs_noise: bool = True
     reset_noise: bool = True
     domain_randomization: bool = True
-    sampling_mode: str = "return"  # return | uniform | start
+    sampling_mode: str = "return"  # return | uniform | start | sgs
     hard_clip_cap: float = 0.01  # MultiClipMotionCommandCfg.hard_clip_cap (0 = the paper's sampler)
     replay_capacity: int = 1000
     record_transitions: bool = True

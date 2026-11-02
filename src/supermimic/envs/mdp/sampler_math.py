@@ -1,6 +1,9 @@
-"""Return-based reset sampler: per-step returns relative to the attainable return (no mjlab dependency)."""
+"""Reset sampler math: per-step returns relative to the attainable return, per-clip cap, success-guided sampling
+(no mjlab dependency)."""
 
 from __future__ import annotations
+
+import math
 
 import torch
 
@@ -55,6 +58,37 @@ def cap_group_mass(
     scale = torch.empty_like(scale_sorted).scatter_(0, order, scale_sorted)
     any_capped = first > 0
     return torch.where(any_capped, h * scale[group], h), mass, torch.where(any_capped, mass * scale, mass)
+
+
+def survival_labels(
+    lens: torch.Tensor, terminated: torch.Tensor, censored: torch.Tensor, horizon: int, T: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-step binary success for success-guided sampling: did the episode survive ``horizon`` more steps?
+
+    lens: (k,) episode lengths; terminated: (k,) episode ended in a failure (termination, not a time-out);
+    censored: (k,) episode was cut by the time limit before the clip end (its last steps have no outcome).
+    Step t succeeds unless the episode terminated within ``horizon`` steps after it (lens - t <= horizon);
+    reaching the clip end counts as success however few steps remain. Returns (success (k, T) float, valid
+    (k, T) bool): padding and censored steps with fewer than ``horizon`` observed steps left are invalid.
+    """
+    remaining = lens[:, None] - torch.arange(T, device=lens.device)[None, :]
+    valid = (remaining > 0) & ~(censored[:, None] & (remaining < horizon))
+    success = ~(terminated[:, None] & (remaining <= horizon))
+    return success.float(), valid
+
+
+def sgs_weights(success: torch.Tensor, target: float, kappa: float, temperature: float, eps: float) -> torch.Tensor:
+    """Success-guided sampling distribution over configurations (Zhang et al., arXiv 2610.12465, Sec. 3).
+
+    w_i = (p_i + eps)^(kappa t) (1 - p_i + eps)^(kappa (1 - t)),  l_i = log(w_i + eps),  P(i) = softmax(l / T).
+    The Beta-shaped kernel peaks at success rate ``target`` (its mode) and falls towards both solved (p = 1) and
+    hopeless (p = 0) configurations; ``kappa`` sets how sharp the peak is, ``temperature`` flattens the softmax.
+    Computed in log space (float64) so ~1e5-1e6 configurations normalize exactly.
+    """
+    p = success.to(torch.float64)
+    logw = kappa * target * torch.log(p + eps) + kappa * (1.0 - target) * torch.log1p(-p + eps)
+    ell = torch.logaddexp(logw, torch.full_like(logw, math.log(eps)))
+    return torch.softmax(ell / temperature, dim=0).to(success.dtype)
 
 
 def bin_return_from_checkpoint(ck: dict, g_max: float):

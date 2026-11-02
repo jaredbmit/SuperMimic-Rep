@@ -41,9 +41,17 @@ class EnvCfg:
     obs_noise: bool = True
     reset_noise: bool = True
     domain_randomization: bool = True
-    sampling_mode: str = "return"
+    sampling_mode: str = "return"  # return | uniform | start | sgs (success-guided, arXiv 2610.12465)
     # Largest share of the return sampler's hard mass per clip; 0 = the paper's softmax alone (not in the paper).
     hard_clip_cap: float = 0.01
+    # sampling_mode "sgs" (MultiClipMotionCommandCfg.sgs_*): kernel mode, concentration, temperature, floor,
+    # survival horizon (steps), prior success rate. Defaults = the paper's locomotion values.
+    sgs_target: float = 0.66
+    sgs_kappa: float = 5.0
+    sgs_temp: float = 2.0
+    sgs_eps: float = 1e-8
+    sgs_horizon: int = 50
+    sgs_init: float = 0.5
     replay_capacity: int = 1000
     future_frames: int = 10
     compact_library: bool = False
