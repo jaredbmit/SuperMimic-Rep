@@ -66,3 +66,35 @@ def test_excess_goes_to_uncapped_groups_in_proportion_and_cascades():
     expect = torch.tensor([0.3, 0.3, 0.1, 0.1, 0.1, 0.1], dtype=torch.float64)
     assert torch.allclose(_group_mass(out, group, 6), expect, atol=1e-12)
     assert torch.allclose(out[:2], torch.tensor([0.2, 0.1], dtype=torch.float64), atol=1e-12)
+
+
+def test_forty_clips_with_cap_0_01_stay_a_probability_vector_in_float32():
+    # 40 clips (LAFAN1) with cap 0.01: the cap is raised to 1/40, so every clip is capped and the smallest clip's
+    # remaining mass (~1e-8, below float32 eps once clips differentiate) used to come out as total - prefix <= 0,
+    # scaling that clip by ~1e36 (training: hard_mass_clip_end_bins ~1e26, hard_eff_clips 0, all resets on one clip).
+    g = torch.Generator().manual_seed(0)
+    n = 40
+    group = torch.arange(n).repeat_interleave(torch.randint(30, 250, (n,), generator=g))
+    worst = 0.0
+    for _ in range(200):
+        clip_g = 1 - 0.65 * torch.rand(n, generator=g)
+        G = (clip_g[group] - 0.05 * torch.rand(len(group), generator=g)).clamp(0, 1)
+        h = torch.softmax(-25 * G, 0)
+        out, _, after = cap_group_mass(h, group, n, cap=0.01)
+        assert torch.isfinite(out).all()
+        worst = max(worst, abs(out.sum().item() - 1.0), (after - 1 / n).abs().max().item() * n)
+    assert worst < 1e-4
+
+
+def test_suffix_sum_matches_float64_on_a_large_library():
+    # Loco-sized case (cap 0.01 feasible, ~100 capped clips): float32 result equals the float64 one to rounding.
+    g = torch.Generator().manual_seed(2)
+    n = 29458
+    group = torch.arange(n).repeat_interleave(torch.randint(1, 6, (n,), generator=g))
+    G = 0.9 + 0.1 * torch.rand(len(group), generator=g, dtype=torch.float64)
+    G[: 400] = 0.2 + 0.3 * torch.rand(400, generator=g, dtype=torch.float64)
+    h64 = torch.softmax(-25 * G, 0)
+    out32, before, _ = cap_group_mass(h64.float(), group, n, cap=0.01)
+    out64, _, _ = cap_group_mass(h64, group, n, cap=0.01)
+    assert before.max() > 0.01  # the cap binds
+    assert torch.allclose(out32.double(), out64, rtol=1e-4, atol=1e-12)

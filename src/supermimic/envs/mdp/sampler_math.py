@@ -49,7 +49,10 @@ def cap_group_mass(
     m, order = torch.sort(mass, descending=True)
     k = torch.arange(num_groups, device=h.device, dtype=h.dtype)
     total = m.sum()
-    rest = (total - (torch.cumsum(m, 0) - m)).clamp_min(torch.finfo(h.dtype).tiny)
+    # Mass of the groups from k on as a suffix sum, not total - prefix: when nearly every group is capped (cap close
+    # to 1 / num_groups) the prefix difference cancels to 0 or below in float32 for the smallest groups, and the
+    # clamp then scaled the smallest group by ~1e36 (40 LAFAN1 clips with cap 0.01).
+    rest = torch.flip(torch.cumsum(torch.flip(m, (0,)), 0), (0,)).clamp_min(torch.finfo(h.dtype).tiny)
     s = (total - k * cap) / rest
     fits = m * s <= cap
     fits[-1] = True  # with cap >= 1 / num_groups the last group always fits (guards against rounding)

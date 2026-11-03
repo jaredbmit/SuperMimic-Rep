@@ -57,6 +57,9 @@ class MultiClipMotionCommand(CommandTerm):
             compact=cfg.compact_library, store_dtype=torch.float16 if cfg.library_fp16 else torch.float32,
         )
         print(f"[INFO] {self.library.summary()}")
+        if 0 < cfg.hard_clip_cap * self.library.num_clips <= 1:
+            print(f"[WARN] hard_clip_cap {cfg.hard_clip_cap} x {self.library.num_clips} clips <= 1: the cap is raised to "
+                  f"1/{self.library.num_clips}, i.e. the hard mass is split evenly over clips (softmax only within a clip)")
         lib = self.library
 
         n = self.num_envs
@@ -292,8 +295,9 @@ class MultiClipMotionCommand(CommandTerm):
         # Not in the paper: no clip gets more than hard_clip_cap of the hard mass (the memory term inherits it).
         hard, clip_mass, clip_mass_capped = cap_group_mass(hard, lib.bin_clip, lib.num_clips, cfg.hard_clip_cap)
         self.metrics["hard_top_clip_share"][:] = clip_mass.max()
-        self.metrics["hard_eff_clips"][:] = 1.0 / (clip_mass_capped * clip_mass_capped).sum()
-        self.metrics["hard_mass_clip_end"][:] = (hard * lib.bin_is_clip_end).sum()
+        # Scale-invariant (relative to the hard mass actually used), so a broken hard vector cannot show up as 1e26.
+        self.metrics["hard_eff_clips"][:] = clip_mass_capped.sum() ** 2 / (clip_mass_capped * clip_mass_capped).sum()
+        self.metrics["hard_mass_clip_end"][:] = (hard * lib.bin_is_clip_end).sum() / hard.sum()
         self.bin_memory = (1 - cfg.memory_alpha) * self.bin_memory + cfg.memory_alpha * hard
         p = (
             cfg.uniform_ratio / lib.num_bins
