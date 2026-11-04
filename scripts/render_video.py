@@ -1,8 +1,10 @@
 """Render a trained policy tracking reference clips to MP4, with the reference as a translucent ghost.
 
-Same deterministic settings as the benchmark (scripts/eval_benchmark.py: no noise, no DR, clip from its first frame,
-paper terminations). Per step it also records the two termination quantities (pelvis height error, tilt error =
-difference of the gravity z in the pelvis frame) and reports which one ended a failed clip.
+Same settings as the benchmark (scripts/eval_benchmark.py): by default deterministic (no noise, no DR, clip from its
+first frame, paper terminations); ``--train-noise --eval-seed k`` plays under the checkpoint's training perturbations
+(same ``EvalCondition`` as the benchmark; one env, so the DR draw differs from the benchmark's env for that clip).
+Per step it also records the two termination quantities (pelvis height error, tilt error = difference of the gravity z
+in the pelvis frame) and reports which one ended a failed clip.
 
   MUJOCO_GL=egl python scripts/render_video.py --ckpt logs/run/ckpt_0044000.pt \
       --library $SM_BANK/bones_seed/library/bones_seed_compact.pt --pattern '^flip_180_' --max-clips 3 --out tmp/videos
@@ -13,6 +15,7 @@ Outputs per clip: <out>/<clip>.mp4 and <clip>.npz (per-step height / tilt errors
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -69,35 +72,23 @@ def main(
     height: int = 540,
     stride: int = 1,
     device: str = "cuda:0",
+    train_noise: bool = False,
+    eval_seed: int = 0,
 ) -> None:
     import mediapy as media
     from mjlab.envs import ManagerBasedRlEnv
     from mjlab.utils.torch import configure_torch_backends
 
     from supermimic.config import obs_mode_from_config
-    from supermimic.envs import SuperMimicEnvCfgArgs
     from supermimic.envs.mdp.motion_library import discover_npz
     from supermimic.envs.tracking_env_cfg import make_env_cfg
-    from supermimic.eval.benchmark import load_policy_from_checkpoint
+    from supermimic.eval.benchmark import EvalCondition, benchmark_env_args, load_policy_from_checkpoint
 
     policy, cfg = load_policy_from_checkpoint(ckpt, device)
     files = [str(library)] if library else [str(f) for f in discover_npz(npz_dir)]
-    a = SuperMimicEnvCfgArgs(
-        npz_files=files,
-        num_envs=1,
-        future_frames=cfg["env"]["future_frames"],
-        episode_length_s=1.0e5,  # clip end decides
-        action_noise_std=0.0,
-        obs_noise=False,
-        reset_noise=False,
-        domain_randomization=False,
-        sampling_mode="start",
-        record_transitions=False,
-        seed=0,
-        obs_mode=obs_mode_from_config(cfg),
-        compact_library=library is not None,
-        debug_vis=True,  # reference ghost
-    )
+    cond = EvalCondition.from_config(cfg, train_noise, train_noise, train_noise, train_noise, seed=eval_seed)
+    a = benchmark_env_args(files, 1, cfg["env"]["future_frames"], obs_mode_from_config(cfg), library is not None, cond)
+    a = dataclasses.replace(a, debug_vis=True)  # reference ghost
     env_cfg = make_env_cfg(a)
     env_cfg.viewer.width, env_cfg.viewer.height = width, height
     configure_torch_backends()
@@ -114,6 +105,7 @@ def main(
     fps = round(1.0 / env.step_dt / stride)
     h_thr = env_cfg.terminations["root_height"].params["threshold"]
     t_thr = env_cfg.terminations["root_tilt"].params["threshold"]
+    print(f"[INFO] condition {cond.summary()}")
     print(f"[INFO] {len(sel)} clip(s), obs_mode {a.obs_mode}, {fps} fps, thresholds height {h_thr} m / tilt {t_thr}")
     try:
         for ci in sel:
@@ -128,7 +120,7 @@ def main(
                     if t % stride == 0:
                         h = _rec["height_err"][-1] if _rec["height_err"] else 0.0
                         g = _rec["tilt_err"][-1] if _rec["tilt_err"] else 0.0
-                        lines = [name, f"step {t}/{length}  return/step {ret / max(t, 1) / 0.1:.3f}", f"height err {h:.3f} (thr {h_thr})  tilt err {g:.3f} (thr {t_thr})"]
+                        lines = [f"{name} [{cond.name}, seed {cond.seed}]", f"step {t}/{length}  return/step {ret / max(t, 1) / 0.1:.3f}", f"height err {h:.3f} (thr {h_thr})  tilt err {g:.3f} (thr {t_thr})"]
                         frames.append(_overlay(env.render(), lines, red=h > 0.8 * h_thr or g > 0.8 * t_thr))
                     obs, rew, term, tout, _ = env.step(policy(obs["policy"], obs["goal"]))
                     ret += float(rew[0])
