@@ -1,6 +1,7 @@
 """Failed motions per motion group, as paper Table A.8, from a benchmark JSON (or group sizes of a clip list).
 
   python scripts/eval_groups.py --benchmark logs/bones_main/benchmark_ckpt_h3.json
+  python scripts/eval_groups.py --benchmark logs/bones_main/benchmark_noisy_ckpt_h3.json   # training-condition run
   python scripts/eval_groups.py --clip-list keep.txt          # sizes only (T57 check against Table A.8)
 
 Groups are assigned by clip name, first match wins. The patterns are our reading of the paper's group names;
@@ -38,7 +39,10 @@ def group_of(name: str) -> str:
 
 def main(benchmark: Path | None = None, clip_list: Path | None = None) -> None:
     if benchmark is not None:
-        clips = json.loads(benchmark.read_text())["clips"]
+        d = json.loads(benchmark.read_text())
+        cond = d["summary"].get("condition", {"name": "det"})  # JSONs from before the condition field: paper protocol
+        print(f"condition: {cond}" + ("" if cond["name"] == "det" else "  (training-condition benchmark, not the paper protocol)"))
+        clips = d["clips"]
         rows = [(c["name"], bool(c["failed"])) for c in clips]
     elif clip_list is not None:
         rows = [(l.strip(), False) for l in open(clip_list) if l.strip()]

@@ -2,11 +2,16 @@
 
 Every clip is played once from its first frame with the deterministic policy:
 no observation/action noise, no reset noise, no domain randomization (foot friction 1.0),
-deterministic physics. A clip *fails* if the training termination (pelvis height /
-tilt vs reference) fires before the clip ends. Normalised return (paper §4) = sum of
-per-step rewards / the largest sum the clip allows (max step reward * steps of the whole
-clip), so a policy that terminates early scores low. ``norm_return_per_step`` keeps the
-upstream variant (divided by the steps actually executed) for comparison only.
+deterministic physics (``EvalCondition()``, the default). A clip *fails* if the training
+termination (pelvis height / tilt vs reference) fires before the clip ends. Normalised return
+(paper §4) = sum of per-step rewards / the largest sum the clip allows (max step reward * steps
+of the whole clip), so a policy that terminates early scores low. ``norm_return_per_step`` keeps
+the upstream variant (divided by the steps actually executed) for comparison only.
+
+``EvalCondition.from_config`` re-enables the checkpoint's own training-time obs noise / action
+noise / DR / reset noise (same env code, values from the saved config) with a fixed seed for the
+DR draw and the noise RNG, still whole clips from frame 0: a training-condition benchmark
+(``benchmark_noisy_*.json``), not comparable with the paper protocol.
 """
 
 from __future__ import annotations
@@ -20,6 +25,45 @@ import torch
 from supermimic.config import obs_mode_from_config
 from supermimic.envs import SuperMimicEnvCfgArgs, make_env
 from supermimic.policy.nets import Policy, PolicyCfg
+
+
+@dataclass(frozen=True)
+class EvalCondition:
+    """Execution condition of a benchmark. The default is the paper protocol (App. F.1): everything off."""
+
+    obs_noise: bool = False
+    action_noise_std: float = 0.0
+    domain_randomization: bool = False
+    reset_noise: bool = False
+    seed: int = 0  # env seed: DR draw (startup events) and the torch RNG behind obs/action/reset noise
+
+    @classmethod
+    def from_config(cls, cfg: dict, obs_noise: bool, action_noise: bool, dr: bool, reset_noise: bool, seed: int = 0) -> EvalCondition:
+        """Each requested component takes the checkpoint's training setting (off if it trained without it)."""
+        e = cfg["env"]
+        return cls(
+            obs_noise=obs_noise and bool(e["obs_noise"]),
+            action_noise_std=float(e["action_noise_std"]) if action_noise else 0.0,
+            domain_randomization=dr and bool(e["domain_randomization"]),
+            reset_noise=reset_noise and bool(e["reset_noise"]),
+            seed=seed,
+        )
+
+    @property
+    def name(self) -> str:
+        """``det`` (paper protocol), ``noisy`` (all four training perturbations) or e.g. ``obs+act``."""
+        on = [t for t, v in (("obs", self.obs_noise), ("act", self.action_noise_std > 0), ("dr", self.domain_randomization), ("rst", self.reset_noise)) if v]
+        return "det" if not on else "noisy" if len(on) == 4 else "+".join(on)
+
+    def default_out(self, ckpt: str | Path) -> Path:
+        """``benchmark_<ckpt>.json`` for det (unchanged), ``benchmark_<name>_<ckpt>[_seed<k>].json`` otherwise."""
+        ckpt = Path(ckpt)
+        if self.name == "det":
+            return ckpt.parent / f"benchmark_{ckpt.stem}.json"
+        return ckpt.parent / f"benchmark_{self.name}_{ckpt.stem}{f'_seed{self.seed}' if self.seed else ''}.json"
+
+    def summary(self) -> dict:
+        return {"name": self.name, **asdict(self)}
 
 
 @dataclass
@@ -47,27 +91,31 @@ def load_policy_from_checkpoint(path: str | Path, device: str) -> tuple[Policy, 
     return policy, ck["config"]
 
 
-@torch.no_grad()
-def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, obs_mode: str = "proprio_only", compact_library: bool = False, num_clips: int | None = None) -> list[ClipResult]:
-    """``npz_files`` is a list of clip npz files, or ``[library.pt]`` with ``compact_library=True`` (then pass
-    ``num_clips``, the library's clip count, to size the env pool)."""
-    num_envs = min(num_envs or 1024, num_clips if compact_library else len(npz_files))
-    args = SuperMimicEnvCfgArgs(
+def benchmark_env_args(npz_files: list[str], num_envs: int, future_frames: int, obs_mode: str, compact_library: bool, condition: EvalCondition) -> SuperMimicEnvCfgArgs:
+    return SuperMimicEnvCfgArgs(
         npz_files=npz_files,
         num_envs=num_envs,
         future_frames=future_frames,
         episode_length_s=1.0e5,  # clip end decides
-        action_noise_std=0.0,
-        obs_noise=False,
-        reset_noise=False,
-        domain_randomization=False,
+        action_noise_std=condition.action_noise_std,
+        obs_noise=condition.obs_noise,
+        reset_noise=condition.reset_noise,
+        domain_randomization=condition.domain_randomization,
         sampling_mode="start",
         record_transitions=False,
-        seed=0,
+        seed=condition.seed,
         obs_mode=obs_mode,
         compact_library=compact_library,
     )
-    env = make_env(args, device=device)
+
+
+@torch.no_grad()
+def run_benchmark(policy: Policy, npz_files: list[str], device: str = "cuda:0", num_envs: int | None = None, future_frames: int = 10, verbose: bool = True, obs_mode: str = "proprio_only", compact_library: bool = False, num_clips: int | None = None, condition: EvalCondition = EvalCondition()) -> list[ClipResult]:
+    """``npz_files`` is a list of clip npz files, or ``[library.pt]`` with ``compact_library=True`` (then pass
+    ``num_clips``, the library's clip count, to size the env pool). With noise/DR on, results depend on
+    ``num_envs`` too (clip i plays in env i mod num_envs, which fixes its DR draw)."""
+    num_envs = min(num_envs or 1024, num_clips if compact_library else len(npz_files))
+    env = make_env(benchmark_env_args(npz_files, num_envs, future_frames, obs_mode, compact_library, condition), device=device)
     try:
         cmd = env.command_manager.get_term("motion")
         lib = cmd.library
@@ -154,5 +202,6 @@ def summarize(results: list[ClipResult]) -> dict:
     return out
 
 
-def save_results(results: list[ClipResult], path: str | Path) -> None:
-    Path(path).write_text(json.dumps({"summary": summarize(results), "clips": [asdict(r) for r in results]}, indent=1))
+def save_results(results: list[ClipResult], path: str | Path, condition: EvalCondition = EvalCondition(), num_envs: int | None = None) -> None:
+    summary = {**summarize(results), "condition": {**condition.summary(), "num_envs": num_envs}}
+    Path(path).write_text(json.dumps({"summary": summary, "clips": [asdict(r) for r in results]}, indent=1))

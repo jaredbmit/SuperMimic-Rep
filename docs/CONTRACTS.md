@@ -34,6 +34,10 @@ required.
   失败的 clip 只累计到终止为止（所以提前失败得分低）。
 - 改动 benchmark 代码（`src/supermimic/eval/`、`scripts/eval_benchmark.py`）必须开 change 并做 validate，
   且要用改动前后的同一 checkpoint 对比结果。
+- 训练条件变体（`eval_benchmark.py --train-noise`）：同样整条 clip 从首帧播放，但打开该 checkpoint 训练时的观测噪声、
+  动作噪声、域随机化和重置噪声（取自保存的 config），`--eval-seed` 固定 DR 抽样和噪声 RNG；结果写入
+  `benchmark_noisy_<ckpt>[_seed<k>].json`，summary 的 `condition` 字段标明条件。它不是论文口径，不能和
+  `benchmark_<ckpt>.json` 或论文数字放在同一列；随机性存在，比较时注明换 seed 的波动。
 
 ## 数值约定
 ### Rules
